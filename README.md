@@ -93,6 +93,7 @@ multi-claude start debug --extra-args --verbose --extra-args --debug
 
 ```bash
 multi-claude stop <name> [--remove]
+multi-claude stop --all
 ```
 
 Kills the tmux window. By default, the session config is preserved so you can restart later with `start <name>`.
@@ -100,14 +101,17 @@ Kills the tmux window. By default, the session config is preserved so you can re
 | Flag | Description |
 |---|---|
 | `--remove` | Permanently delete the session from the config store |
+| `--all` | Stop all running sessions |
 
 ### `list` — Show all sessions
 
 ```bash
-multi-claude list
+multi-claude list [--json]
 ```
 
 Displays a table of all managed sessions with name, status (▶ running / ■ stopped), model, and working directory. Cross-references the stored JSON state against live tmux windows, so the status is always accurate even if you manually killed a tmux window outside the tool.
+
+With `--json`, outputs machine-readable JSON for scripting.
 
 ### `attach` — Connect to a session
 
@@ -122,26 +126,22 @@ Inside tmux, use:
 - `Ctrl-b <number>` — jump to window by index
 - `Ctrl-b d` — detach (leave the session running)
 
-### `config-show` — Inspect session settings
+### `config` — Inspect or update session settings
 
 ```bash
-multi-claude config-show <name>
+multi-claude config <name>             # Show stored configuration
+multi-claude config <name> [options]   # Update stored configuration
 ```
 
-Prints every stored option for the session: model, working directory, permission mode, effort level, settings file, MCP configs, system prompt, extra args, and timestamps.
+Without options, prints every stored setting for the session: model, working directory, permission mode, effort level, settings file, MCP configs, system prompt, extra args, and timestamps.
 
-### `config-set` — Update session settings
+With options, mutates the stored config. **Does not affect a running session** — you must `restart` for changes to take effect.
 
-```bash
-multi-claude config-set <name> [options]
-```
-
-Mutates the stored config. **Does not affect a running session** — you must `restart` for changes to take effect.
-
-Accepts the same flags as `start`: `--model`, `--dir`, `--system-prompt`, `--permission-mode`, `--effort`, `--settings`, `--mcp-config`, `--extra-args`.
+Accepts the same flags as `start`: `--model`, `--dir`, `--system-prompt`, `--permission-mode`, `--effort`, `--settings`, `--mcp-config`, `--extra-args`. Use `--unset <field>` to clear a field.
 
 ```bash
-multi-claude config-set myproject --model haiku --effort low
+multi-claude config myproject --model haiku --effort low
+multi-claude config myproject --unset systemPrompt extraArgs
 multi-claude restart myproject
 ```
 
@@ -149,9 +149,10 @@ multi-claude restart myproject
 
 ```bash
 multi-claude restart <name>
+multi-claude restart --all
 ```
 
-Shorthand for `stop` + `start` using the saved configuration. Reads the latest config from the store, kills the running tmux window (if any), and creates a fresh one.
+Shorthand for `stop` + `start` using the saved configuration. Reads the latest config from the store, kills the running tmux window (if any), and creates a fresh one. Use `--all` to restart every saved session.
 
 ### `rename` — Rename a session
 
@@ -160,6 +161,18 @@ multi-claude rename <oldName> <newName>
 ```
 
 Renames the session in the config store and renames the tmux window if it's currently running.
+
+### `logs` — Show session output
+
+```bash
+multi-claude logs <name> [-n <lines>]
+```
+
+Prints the tmux pane scrollback buffer for a running session. Useful to check on a session's progress without attaching to it.
+
+| Flag | Description |
+|---|---|
+| `-n, --lines <number>` | Show only the last N lines (default: entire buffer) |
 
 ### `kill-all` — Stop everything
 
@@ -177,6 +190,24 @@ multi-claude models
 
 Prints common model aliases for reference. Use these with the `--model` flag.
 
+### `completion` — Generate shell completion
+
+```bash
+multi-claude completion [bash|zsh]
+```
+
+Generates a shell completion script. Detects your shell from `$SHELL` if not specified.
+
+```bash
+# Bash (add to ~/.bashrc)
+source <(multi-claude completion bash)
+
+# Zsh (add to ~/.zshrc)
+source <(multi-claude completion zsh)
+```
+
+Tab-completes subcommands and session names (reads from config store). After setup, `multi-claude start <TAB>` will suggest existing session names.
+
 ## Configuration File
 
 Sessions are stored in `~/.multi-claude/sessions.json`:
@@ -189,7 +220,6 @@ Sessions are stored in `~/.multi-claude/sessions.json`:
       "name": "myproject",
       "status": "running",
       "tmuxWindow": "multi-claude:myproject",
-      "pid": 12345,
       "config": {
         "name": "myproject",
         "model": "sonnet",

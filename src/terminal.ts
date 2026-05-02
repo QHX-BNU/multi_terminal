@@ -3,6 +3,22 @@ import { SessionConfig } from './types';
 
 const TMUX_SESSION_PREFIX = 'multi-claude';
 
+const VALID_SESSION_NAME = /^[a-zA-Z0-9][-a-zA-Z0-9_]*$/;
+
+export function checkTmux(): boolean {
+  const result = spawnSync('tmux', ['-V'], { stdio: 'ignore' });
+  return result.status === 0;
+}
+
+export function validateSessionName(name: string): string | null {
+  if (!name || name.trim().length === 0) return 'Session name must not be empty.';
+  if (name.includes(':')) return 'Session name must not contain colons (:).';
+  if (name.includes('.')) return 'Session name must not contain dots (.).';
+  if (/\s/.test(name)) return 'Session name must not contain whitespace.';
+  if (!VALID_SESSION_NAME.test(name)) return 'Session name must start with a letter or number and contain only letters, numbers, hyphens, and underscores.';
+  return null;
+}
+
 function shellQuote(arg: string): string {
   return `'${arg.replace(/'/g, "'\\''")}'`;
 }
@@ -146,4 +162,21 @@ export function listRunningWindows(): string[] {
   if (result.status !== 0) return [];
   const output = (result.stdout || '').trim();
   return output ? output.split('\n').filter(Boolean) : [];
+}
+
+/**
+ * Capture the visible content (or scrollback buffer) of a tmux pane.
+ * Returns the text content.
+ */
+export function capturePane(name: string, lines?: number): string {
+  const windowName = `${TMUX_SESSION_PREFIX}:${name}`;
+  const args = ['capture-pane', '-t', windowName, '-p'];
+  if (lines !== undefined && lines > 0) {
+    args.push('-S', `-${lines}`);
+  } else {
+    args.push('-S', '-');
+  }
+  const result = spawnSync('tmux', args, { encoding: 'utf-8' });
+  if (result.status !== 0) return '';
+  return (result.stdout || '');
 }

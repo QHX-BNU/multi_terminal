@@ -20,6 +20,9 @@ import {
   isSessionAlive,
   listRunningWindows,
   renameWindow,
+  checkTmux,
+  validateSessionName,
+  capturePane,
 } from './terminal';
 import { SessionConfig } from './types';
 
@@ -36,6 +39,14 @@ program
   )
   .version('1.0.0');
 
+if (!checkTmux()) {
+  console.error('Error: tmux is not installed or not available in PATH.');
+  console.error('tmux 3.0+ is required. Install it with:');
+  console.error('  sudo apt install tmux    # Debian/Ubuntu');
+  console.error('  brew install tmux        # macOS');
+  process.exit(1);
+}
+
 // ─── start ───────────────────────────────────────────────────────────────────
 
 program
@@ -51,6 +62,9 @@ program
   .option('--extra-args <args...>', 'Extra arguments to pass to claude')
   .option('-f, --force', 'Force restart if session is already running')
   .action((name: string, options: Record<string, any>) => {
+    const nameErr = validateSessionName(name);
+    if (nameErr) { console.error(`Invalid session name: ${nameErr}`); process.exit(1); }
+
     const existing = getSession(name);
     if (existing && isSessionAlive(name)) {
       if (options.force) {
@@ -94,10 +108,31 @@ program
 // ─── stop ────────────────────────────────────────────────────────────────────
 
 program
-  .command('stop <name>')
-  .description('Stop a running Claude Code session')
+  .command('stop [name]')
+  .description('Stop a running Claude Code session (or all sessions with --all)')
   .option('--remove', 'Also remove the session from the managed list')
-  .action((name: string, options: Record<string, any>) => {
+  .option('--all', 'Stop all running sessions')
+  .action((name: string | undefined, options: Record<string, any>) => {
+    if (options.all) {
+      const store = loadSessions();
+      const runningWindows = listRunningWindows();
+      let count = 0;
+      for (const w of runningWindows) {
+        stopSession(w);
+        const entry = store.sessions[w];
+        if (entry) { entry.status = 'stopped'; }
+        count++;
+      }
+      saveSessions(store);
+      console.log(`Stopped ${count} session(s).`);
+      return;
+    }
+
+    if (!name) {
+      console.error('Error: specify a session name or use --all.');
+      process.exit(1);
+    }
+
     const session = getSession(name);
     if (!session) {
       console.log(`No session named "${name}" found.`);
@@ -125,7 +160,8 @@ program
 program
   .command('list')
   .description('List all managed Claude Code sessions')
-  .action(() => {
+  .option('--json', 'Output as JSON')
+  .action((options: Record<string, any>) => {
     const store = loadSessions();
     const sessions = Object.entries(store.sessions).map(([name, state]) => ({
       ...state,
@@ -146,6 +182,17 @@ program
       }
     }
     if (changed) saveSessions(store);
+
+    if (options.json) {
+      const output = sessions.map(s => ({
+        name: s.name,
+        status: runningWindows.includes(s.name) ? 'running' : 'stopped',
+        tmuxWindow: s.tmuxWindow,
+        config: s.config,
+      }));
+      console.log(JSON.stringify(output, null, 2));
+      return;
+    }
 
     if (sessions.length === 0) {
       console.log('No managed sessions found. Use "multi-claude start <name>" to create one.');
@@ -179,6 +226,7 @@ program
     console.log('Commands:');
     console.log('  multi-claude attach <name>   — Attach to a session');
     console.log('  multi-claude stop <name>     — Stop a session');
+    console.log('  multi-claude stop --all      — Stop all sessions');
     console.log('  tmux attach -t multi-claude  — View all sessions in tmux');
   });
 
@@ -188,6 +236,15 @@ program
   .command('attach [name]')
   .description('Attach to the multi-claude tmux session (or a specific window)')
   .action((name?: string) => {
+    if (process.env.TMUX) {
+      console.error('Already inside a tmux session. Detach first (Ctrl-b d) or use:');
+      console.error(`  tmux select-window -t multi-claude${name ? `:${name}` : ''} \\&\\& tmux switch-client -t multi-claude`);
+      process.exit(1);
+    }
+    if (!process.stdin.isTTY) {
+      console.error('Cannot attach: stdin is not a terminal. Are you running from a script?');
+      process.exit(1);
+    }
     try {
       if (name) {
         const session = getSession(name);
@@ -310,9 +367,32 @@ program
 // ─── restart ─────────────────────────────────────────────────────────────────
 
 program
-  .command('restart <name>')
+  .command('restart [name]')
   .description('Restart a session (keeps the same configuration)')
-  .action((name: string) => {
+  .option('--all', 'Restart all saved sessions')
+  .action((name: string | undefined, options: Record<string, any>) => {
+    if (options.all) {
+      const store = loadSessions();
+      let count = 0;
+      for (const [n, state] of Object.entries(store.sessions)) {
+        console.log(`Restarting session "${n}"...`);
+        if (isSessionAlive(n)) stopSession(n);
+        const { tmuxWindow } = startSession(state.config);
+        state.status = 'running';
+        state.tmuxWindow = tmuxWindow;
+        state.config.lastStartedAt = new Date().toISOString();
+        count++;
+      }
+      saveSessions(store);
+      console.log(`Restarted ${count} session(s).`);
+      return;
+    }
+
+    if (!name) {
+      console.error('Error: specify a session name or use --all.');
+      process.exit(1);
+    }
+
     const session = getSession(name);
     if (!session) {
       console.log(`No session named "${name}" found.`);
@@ -344,6 +424,9 @@ program
   .command('rename <oldName> <newName>')
   .description('Rename a session (and its tmux window if running)')
   .action((oldName: string, newName: string) => {
+    const nameErr = validateSessionName(newName);
+    if (nameErr) { console.error(`Invalid session name "${newName}": ${nameErr}`); process.exit(1); }
+
     const session = getSession(oldName);
     if (!session) {
       console.log(`No session named "${oldName}" found.`);
@@ -405,6 +488,159 @@ program
     console.log('Third-party providers (if configured):');
     console.log('  Use the full model ID from your provider.');
     console.log('  See: https://docs.anthropic.com/en/docs/claude-code/settings');
+  });
+
+// ─── logs ───────────────────────────────────────────────────────────────────
+
+program
+  .command('logs <name>')
+  .description('Show recent output from a session (tmux pane scrollback)')
+  .option('-n, --lines <number>', 'Number of lines to show (default: entire buffer)', parseInt)
+  .action((name: string, options: Record<string, any>) => {
+    if (!isSessionAlive(name)) {
+      console.error(`Session "${name}" is not running.`);
+      process.exit(1);
+    }
+    const output = capturePane(name, options.lines);
+    if (!output) {
+      console.log(`(no output captured from session "${name}")`);
+    } else {
+      process.stdout.write(output);
+    }
+  });
+
+// ─── completion ─────────────────────────────────────────────────────────────
+
+program
+  .command('completion [shell]')
+  .description('Generate shell completion script')
+  .action((shell?: string) => {
+    const target = shell || (process.env.SHELL?.includes('zsh') ? 'zsh' : 'bash');
+
+    if (target === 'zsh') {
+      console.log(`#compdef multi-claude
+# shellcheck shell=zsh
+# Generated by: multi-claude completion zsh
+# Add to fpath: cp this file to /usr/local/share/zsh/site-functions/_multi-claude
+#   or append to ~/.zshrc: source <(multi-claude completion zsh)
+
+_multi_claude() {
+  local curcontext=\$curcontext state state_descr line
+  typeset -A opt_args
+
+  local -a commands
+  commands=(
+    'start:Start a new Claude Code session in a tmux window'
+    'stop:Stop a running session'
+    'list:List all managed sessions'
+    'attach:Attach to the tmux session'
+    'config:Show or update session configuration'
+    'restart:Restart a session'
+    'rename:Rename a session'
+    'kill-all:Stop all sessions and kill the tmux session'
+    'models:List common model aliases'
+    'completion:Generate shell completion script'
+  )
+
+  local -a session_names
+  session_names=(\\\${(f)\\"\\$(node -e "try{const s=require(\\'os\\').homedir()+\\'/.multi-claude/sessions.json\\';const d=require(\\'fs\\').readFileSync(s,\\'utf8\\');const j=JSON.parse(d);console.log(Object.keys(j.sessions||{}).join(\\'\\\\n\\'));}catch(e){}" 2>/dev/null)\\"})
+
+  _arguments -C \\
+    '1: :->command' \\
+    '*:: :->args'
+
+  case \\\$state in
+    command)
+      _describe 'command' commands
+      ;;
+    args)
+      case \\\$words[1] in
+        start)
+          _arguments \\
+            '-m[LLM model]:model:()' \\
+            '--model[LLM model]:model:()' \\
+            '-d[Working directory]:dir:_directories' \\
+            '--dir[Working directory]:dir:_directories' \\
+            '-s[Custom system prompt]' \\
+            '--system-prompt[Custom system prompt]' \\
+            '-p[Permission mode]:mode:(default acceptEdits plan bypassPermissions)' \\
+            '--permission-mode[Permission mode]:mode:(default acceptEdits plan bypassPermissions)' \\
+            '-e[Effort level]:level:(low medium high xhigh max)' \\
+            '--effort[Effort level]:level:(low medium high xhigh max)' \\
+            '--settings[Settings file]:file:_files' \\
+            '--mcp-config[MCP config files]:file:_files' \\
+            '--extra-args[Extra arguments]' \\
+            '-f[Force restart]' \\
+            '--force[Force restart]' \\
+            '1: :->session_names'
+          ;;
+        stop)
+          _arguments \\
+            '--remove[Also remove from managed list]' \\
+            '--all[Stop all sessions]' \\
+            '1:session:->session_names'
+          ;;
+        attach|config|restart|rename)
+          _arguments '1:session:->session_names'
+          ;;
+      esac
+      ;;
+    session_names)
+      if [[ -n \\\${session_names} ]]; then
+        _describe 'session' session_names
+      fi
+      ;;
+  esac
+}
+
+_multi_claude "\$@"
+`);
+    } else {
+      console.log(`# shellcheck shell=bash
+# Generated by: multi-claude completion bash
+# Source in ~/.bashrc: source <(multi-claude completion bash)
+
+_multi_claude_completion() {
+  local cur prev words cword
+  _init_completion || return
+
+  local opts="start stop list attach config restart rename kill-all models completion"
+  local sessions
+  sessions=\\$(node -e "try{const s=require('os').homedir()+'/.multi-claude/sessions.json';const d=require('fs').readFileSync(s,'utf8');const j=JSON.parse(d);console.log(Object.keys(j.sessions||{}).join(' '));}catch(e){}" 2>/dev/null)
+
+  case \\\${prev} in
+    start)
+      if [[ \\\${cur} == -* ]]; then
+        COMPREPLY=( \\$(compgen -W "-m --model -d --dir -s --system-prompt -p --permission-mode -e --effort --settings --mcp-config --extra-args -f --force" -- "\\\${cur}") )
+      else
+        COMPREPLY=( \\$(compgen -W "\\\${sessions}" -- "\\\${cur}") )
+      fi
+      return 0
+      ;;
+    stop|attach|config|restart|rename)
+      COMPREPLY=( \\$(compgen -W "\\\${sessions}" -- "\\\${cur}") )
+      return 0
+      ;;
+    stop)
+      if [[ \\\${cur} == -* ]]; then
+        COMPREPLY=( \\$(compgen -W "--remove --all" -- "\\\${cur}") )
+      else
+        COMPREPLY=( \\$(compgen -W "\\\${sessions}" -- "\\\${cur}") )
+      fi
+      return 0
+      ;;
+    -m|--model|-d|--dir|-p|--permission-mode|-e|--effort|--settings|--mcp-config)
+      return 0
+      ;;
+  esac
+
+  COMPREPLY=( \\$(compgen -W "\\\${opts}" -- "\\\${cur}") )
+  return 0
+}
+
+complete -F _multi_claude_completion multi-claude
+`);
+    }
   });
 
 program.parse(process.argv);
