@@ -1,0 +1,21 @@
+{
+  "name": "multi-claude",
+  "version": "1.0.0",
+  "description": "Multi-terminal Claude Code session manager — run multiple Claude Code instances simultaneously with different LLM backends",
+  "main": "dist/index.js",
+  "bin": {
+    "multi-claude": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsc && node dist/index.js"
+  },
+  "dependencies": {
+    "commander": "^12.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}
