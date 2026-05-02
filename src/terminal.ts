@@ -1,7 +1,7 @@
 import { spawnSync } from 'child_process';
 import { SessionConfig } from './types';
 
-const TMUX_SESSION_PREFIX = 'multi-claude';
+export const TMUX_SESSION_PREFIX = 'multi-claude';
 
 const VALID_SESSION_NAME = /^[a-zA-Z0-9][-a-zA-Z0-9_]*$/;
 
@@ -73,6 +73,31 @@ function tmux(args: string[]): void {
 }
 
 /**
+ * Poll until a tmux pane is ready (shell initialized).
+ * After creating a new window, the shell inside needs a moment to start.
+ * Sending keys too early causes them to be lost.
+ */
+function waitForPane(windowName: string, timeoutMs = 3000): void {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    const result = spawnSync('tmux', ['list-panes', '-t', windowName], { encoding: 'utf-8' });
+    if (result.status === 0 && (result.stdout || '').trim()) {
+      spawnSync('sleep', ['0.15']);
+      return;
+    }
+    spawnSync('sleep', ['0.1']);
+  }
+}
+
+/**
+ * Check whether the `claude` binary is available in PATH.
+ */
+export function checkClaudeCli(): boolean {
+  const result = spawnSync('which', ['claude'], { stdio: 'ignore' });
+  return result.status === 0;
+}
+
+/**
  * Start a new Claude Code session inside a tmux window.
  * Uses tmux send-keys to avoid shell injection through tmux new-window's shell command argument.
  */
@@ -80,12 +105,10 @@ export function startSession(config: SessionConfig): { tmuxWindow: string } {
   const windowName = `${TMUX_SESSION_PREFIX}:${config.name}`;
   const workDir = config.workingDir || process.cwd();
 
-  // Kill existing window with the same name if it exists
   if (tmuxHasWindow(windowName)) {
     tmux(['kill-window', '-t', windowName]);
   }
 
-  // Ensure the tmux session exists, or create it
   const sessionExists = tmuxHasWindow(TMUX_SESSION_PREFIX);
   if (sessionExists) {
     tmux(['new-window', '-t', TMUX_SESSION_PREFIX, '-n', config.name]);
@@ -93,12 +116,12 @@ export function startSession(config: SessionConfig): { tmuxWindow: string } {
     tmux(['new-session', '-d', '-s', TMUX_SESSION_PREFIX, '-n', config.name]);
   }
 
-  // Build the command with proper shell quoting (for the target shell in the pane)
+  waitForPane(windowName);
+
   const claudeArgs = buildClaudeArgs(config);
   const quotedArgs = claudeArgs.map(shellQuote);
   const cmdLine = `cd ${shellQuote(workDir)} && claude ${quotedArgs.join(' ')}\n`;
 
-  // Send the command to the window as literal keystrokes (no shell interpretation in our process)
   spawnSync('tmux', ['send-keys', '-l', '-t', windowName, cmdLine], { stdio: 'ignore' });
 
   return { tmuxWindow: windowName };

@@ -2,6 +2,7 @@ export interface SessionConfig {
   name: string;
   model?: string;
   workingDir?: string;
+  description?: string;
   systemPrompt?: string;
   permissionMode?: string;
   effort?: string;

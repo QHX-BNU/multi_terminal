@@ -21,10 +21,13 @@ import {
   listRunningWindows,
   renameWindow,
   checkTmux,
+  checkClaudeCli,
   validateSessionName,
   capturePane,
+  TMUX_SESSION_PREFIX,
 } from './terminal';
 import { SessionConfig } from './types';
+import { generateZshCompletion, generateBashCompletion } from './completion';
 
 const RESET = '\x1b[0m';
 const GREEN = '\x1b[32m';
@@ -47,13 +50,22 @@ if (!checkTmux()) {
   process.exit(1);
 }
 
+if (!checkClaudeCli()) {
+  console.error('Error: claude CLI is not installed or not available in PATH.');
+  console.error('Install Claude Code with:');
+  console.error('  npm install -g @anthropic-ai/claude-code');
+  console.error('  See: https://docs.anthropic.com/en/docs/claude-code');
+  process.exit(1);
+}
+
 // ─── start ───────────────────────────────────────────────────────────────────
 
 program
-  .command('start <name>')
+  .command('start [name]')
   .description('Start a new Claude Code session in a tmux window')
   .option('-m, --model <model>', 'LLM model alias or full name (e.g. sonnet, opus, claude-sonnet-4-6)')
   .option('-d, --dir <path>', 'Working directory for the session')
+  .option('--desc <description>', 'Description or notes for the session')
   .option('-s, --system-prompt <prompt>', 'Custom system prompt')
   .option('-p, --permission-mode <mode>', 'Permission mode')
   .option('-e, --effort <level>', 'Effort level (low, medium, high, xhigh, max)')
@@ -61,7 +73,32 @@ program
   .option('--mcp-config <configs...>', 'MCP server config files (space-separated)')
   .option('--extra-args <args...>', 'Extra arguments to pass to claude')
   .option('-f, --force', 'Force restart if session is already running')
-  .action((name: string, options: Record<string, any>) => {
+  .option('--all', 'Start all stopped sessions')
+  .action((name: string | undefined, options: Record<string, any>) => {
+    if (options.all) {
+      const store = loadSessions();
+      let count = 0;
+      for (const [n, state] of Object.entries(store.sessions)) {
+        if (state.status === 'stopped' || !isSessionAlive(n)) {
+          console.log(`Starting session "${n}"...`);
+          if (isSessionAlive(n)) stopSession(n);
+          const { tmuxWindow } = startSession(state.config);
+          state.status = 'running';
+          state.tmuxWindow = tmuxWindow;
+          state.config.lastStartedAt = new Date().toISOString();
+          count++;
+        }
+      }
+      saveSessions(store);
+      console.log(`Started ${count} session(s).`);
+      return;
+    }
+
+    if (!name) {
+      console.error('Error: specify a session name or use --all.');
+      process.exit(1);
+    }
+
     const nameErr = validateSessionName(name);
     if (nameErr) { console.error(`Invalid session name: ${nameErr}`); process.exit(1); }
 
@@ -81,6 +118,7 @@ program
       name,
       model: options.model ?? prev?.model,
       workingDir: options.dir ? path.resolve(options.dir) : (prev?.workingDir ?? process.cwd()),
+      description: options.desc ?? prev?.description,
       systemPrompt: options.systemPrompt ?? prev?.systemPrompt,
       permissionMode: options.permissionMode ?? prev?.permissionMode,
       effort: options.effort ?? prev?.effort,
@@ -101,6 +139,7 @@ program
     console.log(`  Tmux window : ${tmuxWindow}`);
     console.log(`  Model       : ${config.model || '(default)'}`);
     console.log(`  Work dir    : ${config.workingDir}`);
+    if (config.description) console.log(`  Description : ${config.description}`);
     console.log();
     console.log(`Use "multi-claude attach ${name}" to connect, or "tmux attach -t multi-claude" to see all sessions.`);
   });
@@ -161,6 +200,7 @@ program
   .command('list')
   .description('List all managed Claude Code sessions')
   .option('--json', 'Output as JSON')
+  .option('--filter <status>', 'Filter by status: running, stopped')
   .action((options: Record<string, any>) => {
     const store = loadSessions();
     const sessions = Object.entries(store.sessions).map(([name, state]) => ({
@@ -169,7 +209,6 @@ program
     }));
     const runningWindows = listRunningWindows();
 
-    // Sync status of all sessions in a single read-modify-write cycle
     let changed = false;
     for (const s of sessions) {
       const alive = runningWindows.includes(s.name);
@@ -183,8 +222,12 @@ program
     }
     if (changed) saveSessions(store);
 
+    const filtered = options.filter
+      ? sessions.filter(s => (options.filter === 'running') === runningWindows.includes(s.name))
+      : sessions;
+
     if (options.json) {
-      const output = sessions.map(s => ({
+      const output = filtered.map(s => ({
         name: s.name,
         status: runningWindows.includes(s.name) ? 'running' : 'stopped',
         tmuxWindow: s.tmuxWindow,
@@ -194,31 +237,36 @@ program
       return;
     }
 
-    if (sessions.length === 0) {
-      console.log('No managed sessions found. Use "multi-claude start <name>" to create one.');
+    if (filtered.length === 0) {
+      const msg = options.filter
+        ? `No ${options.filter} sessions found.`
+        : 'No managed sessions found. Use "multi-claude start <name>" to create one.';
+      console.log(msg);
       return;
     }
 
-    console.log('Managed Claude Code sessions:\n');
+    console.log(`Managed Claude Code sessions${options.filter ? ` (${options.filter})` : ''}:\n`);
 
-    const nameWidth = Math.max(20, ...sessions.map(s => s.name.length));
+    const nameWidth = Math.max(20, ...filtered.map(s => s.name.length));
+    const descWidth = 24;
     console.log(
-      `${'NAME'.padEnd(nameWidth)}  ${'STATUS'.padEnd(10)}  ${'MODEL'.padEnd(20)}  ${'WORK DIR'}`,
+      `${'NAME'.padEnd(nameWidth)}  ${'STATUS'.padEnd(10)}  ${'MODEL'.padEnd(20)}  ${'DESCRIPTION'.padEnd(descWidth)}  ${'WORK DIR'}`,
     );
     console.log(
-      `${'-'.repeat(nameWidth)}  ${'-'.repeat(10)}  ${'-'.repeat(20)}  ${'-'.repeat(40)}`,
+      `${'-'.repeat(nameWidth)}  ${'-'.repeat(10)}  ${'-'.repeat(20)}  ${'-'.repeat(descWidth)}  ${'-'.repeat(40)}`,
     );
 
-    for (const s of sessions) {
+    for (const s of filtered) {
       const alive = runningWindows.includes(s.name);
       const color = alive ? GREEN : RED;
       const plainStatus = alive ? '▶ running' : '■ stopped';
       const status = `${color}${plainStatus.padEnd(10)}${RESET}`;
-      const model = s.config.model || '(default)';
+      const model = (s.config.model || '(default)').slice(0, 20);
+      const desc = (s.config.description || '').slice(0, descWidth);
       const workDir = s.config.workingDir || '(unknown)';
 
       console.log(
-        `${s.name.padEnd(nameWidth)}  ${status}  ${model.padEnd(20)}  ${workDir}`,
+        `${s.name.padEnd(nameWidth)}  ${status}  ${model.padEnd(20)}  ${desc.padEnd(descWidth)}  ${workDir}`,
       );
     }
 
@@ -227,6 +275,7 @@ program
     console.log('  multi-claude attach <name>   — Attach to a session');
     console.log('  multi-claude stop <name>     — Stop a session');
     console.log('  multi-claude stop --all      — Stop all sessions');
+    console.log('  multi-claude start --all     — Start all stopped sessions');
     console.log('  tmux attach -t multi-claude  — View all sessions in tmux');
   });
 
@@ -276,13 +325,15 @@ program
   .description('Show or update session configuration')
   .option('-m, --model <model>', 'Change LLM model')
   .option('-d, --dir <path>', 'Change working directory')
+  .option('--desc <description>', 'Change session description')
   .option('-s, --system-prompt <prompt>', 'Change system prompt')
   .option('-p, --permission-mode <mode>', 'Change permission mode')
   .option('-e, --effort <level>', 'Change effort level')
   .option('--settings <file>', 'Change settings JSON file for custom API providers')
   .option('--mcp-config <configs...>', 'Change MCP server config files')
   .option('--extra-args <args...>', 'Change extra arguments passed to claude')
-  .option('--unset <fields...>', 'Unset configuration fields (model, workingDir, systemPrompt, permissionMode, effort, settingsFile, mcpConfig, extraArgs)')
+  .option('--json', 'Output configuration as JSON')
+  .option('--unset <fields...>', 'Unset configuration fields (model, workingDir, description, systemPrompt, permissionMode, effort, settingsFile, mcpConfig, extraArgs)')
   .action((name: string, options: Record<string, any>) => {
     const session = getSession(name);
     if (!session) {
@@ -293,6 +344,7 @@ program
     const isModifying =
       options.model !== undefined ||
       options.dir !== undefined ||
+      options.desc !== undefined ||
       options.systemPrompt !== undefined ||
       options.permissionMode !== undefined ||
       options.effort !== undefined ||
@@ -304,7 +356,12 @@ program
     const cfg = session.config;
 
     if (!isModifying) {
+      if (options.json) {
+        console.log(JSON.stringify(cfg, null, 2));
+        return;
+      }
       console.log(`Configuration for "${name}":`);
+      console.log(`  Description    : ${cfg.description || '(none)'}`);
       console.log(`  Model          : ${cfg.model || '(default)'}`);
       console.log(`  Working Dir    : ${cfg.workingDir || '(not set)'}`);
       console.log(`  Permission Mode: ${cfg.permissionMode || '(default)'}`);
@@ -320,6 +377,7 @@ program
 
     if (options.model !== undefined) cfg.model = options.model || undefined;
     if (options.dir !== undefined) cfg.workingDir = options.dir ? path.resolve(options.dir) : undefined;
+    if (options.desc !== undefined) cfg.description = options.desc || undefined;
     if (options.systemPrompt !== undefined) cfg.systemPrompt = options.systemPrompt || undefined;
     if (options.permissionMode !== undefined) cfg.permissionMode = options.permissionMode || undefined;
     if (options.effort !== undefined) cfg.effort = options.effort || undefined;
@@ -328,9 +386,10 @@ program
     if (options.extraArgs !== undefined) cfg.extraArgs = options.extraArgs.length > 0 ? options.extraArgs : undefined;
 
     if (options.unset) {
-      const unsetMap: Record<string, string> = {
+      const unsetMap: Record<string, keyof SessionConfig> = {
         model: 'model',
         workingDir: 'workingDir',
+        description: 'description',
         systemPrompt: 'systemPrompt',
         permissionMode: 'permissionMode',
         effort: 'effort',
@@ -341,7 +400,7 @@ program
       for (const field of options.unset) {
         const key = unsetMap[field];
         if (key) {
-          (cfg as any)[key] = undefined;
+          delete cfg[key];
         } else {
           console.log(`Unknown config field "${field}". Valid fields: ${Object.keys(unsetMap).join(', ')}`);
         }
@@ -351,6 +410,7 @@ program
     addSession({ status: session.status, tmuxWindow: session.tmuxWindow, config: cfg });
 
     console.log(`Configuration for "${name}" updated:`);
+    console.log(`  Description    : ${cfg.description || '(none)'}`);
     console.log(`  Model          : ${cfg.model || '(default)'}`);
     console.log(`  Working Dir    : ${cfg.workingDir || '(not set)'}`);
     console.log(`  Permission Mode: ${cfg.permissionMode || '(default)'}`);
@@ -446,6 +506,38 @@ program
     console.log(`Session renamed: "${oldName}" → "${newName}"${wasRunning ? ` ${GREEN}(running)${RESET}` : ''}`);
   });
 
+// ─── duplicate ───────────────────────────────────────────────────────────────
+
+program
+  .command('duplicate <source> <target>')
+  .description('Clone a session configuration under a new name')
+  .action((source: string, target: string) => {
+    const nameErr = validateSessionName(target);
+    if (nameErr) { console.error(`Invalid session name "${target}": ${nameErr}`); process.exit(1); }
+
+    const sourceSession = getSession(source);
+    if (!sourceSession) {
+      console.log(`No session named "${source}" found.`);
+      return;
+    }
+    if (getSession(target)) {
+      console.log(`Session "${target}" already exists.`);
+      return;
+    }
+
+    const newConfig: SessionConfig = {
+      ...sourceSession.config,
+      name: target,
+      createdAt: new Date().toISOString(),
+      lastStartedAt: undefined,
+    };
+
+    addSession({ status: 'stopped', tmuxWindow: `${TMUX_SESSION_PREFIX}:${target}`, config: newConfig });
+
+    console.log(`Session "${source}" duplicated as "${target}".`);
+    console.log(`Use "multi-claude start ${target}" to start it.`);
+  });
+
 // ─── kill-all ────────────────────────────────────────────────────────────────
 
 program
@@ -495,13 +587,15 @@ program
 program
   .command('logs <name>')
   .description('Show recent output from a session (tmux pane scrollback)')
-  .option('-n, --lines <number>', 'Number of lines to show (default: entire buffer)', parseInt)
+  .option('-n, --lines <number>', 'Number of lines to show (default: 200)', parseInt)
+  .option('-a, --all', 'Capture the entire scrollback buffer')
   .action((name: string, options: Record<string, any>) => {
     if (!isSessionAlive(name)) {
       console.error(`Session "${name}" is not running.`);
       process.exit(1);
     }
-    const output = capturePane(name, options.lines);
+    const lines = options.all ? undefined : (options.lines || 200);
+    const output = capturePane(name, lines);
     if (!output) {
       console.log(`(no output captured from session "${name}")`);
     } else {
@@ -516,130 +610,10 @@ program
   .description('Generate shell completion script')
   .action((shell?: string) => {
     const target = shell || (process.env.SHELL?.includes('zsh') ? 'zsh' : 'bash');
-
     if (target === 'zsh') {
-      console.log(`#compdef multi-claude
-# shellcheck shell=zsh
-# Generated by: multi-claude completion zsh
-# Add to fpath: cp this file to /usr/local/share/zsh/site-functions/_multi-claude
-#   or append to ~/.zshrc: source <(multi-claude completion zsh)
-
-_multi_claude() {
-  local curcontext=\$curcontext state state_descr line
-  typeset -A opt_args
-
-  local -a commands
-  commands=(
-    'start:Start a new Claude Code session in a tmux window'
-    'stop:Stop a running session'
-    'list:List all managed sessions'
-    'attach:Attach to the tmux session'
-    'config:Show or update session configuration'
-    'restart:Restart a session'
-    'rename:Rename a session'
-    'kill-all:Stop all sessions and kill the tmux session'
-    'models:List common model aliases'
-    'completion:Generate shell completion script'
-  )
-
-  local -a session_names
-  session_names=(\\\${(f)\\"\\$(node -e "try{const s=require(\\'os\\').homedir()+\\'/.multi-claude/sessions.json\\';const d=require(\\'fs\\').readFileSync(s,\\'utf8\\');const j=JSON.parse(d);console.log(Object.keys(j.sessions||{}).join(\\'\\\\n\\'));}catch(e){}" 2>/dev/null)\\"})
-
-  _arguments -C \\
-    '1: :->command' \\
-    '*:: :->args'
-
-  case \\\$state in
-    command)
-      _describe 'command' commands
-      ;;
-    args)
-      case \\\$words[1] in
-        start)
-          _arguments \\
-            '-m[LLM model]:model:()' \\
-            '--model[LLM model]:model:()' \\
-            '-d[Working directory]:dir:_directories' \\
-            '--dir[Working directory]:dir:_directories' \\
-            '-s[Custom system prompt]' \\
-            '--system-prompt[Custom system prompt]' \\
-            '-p[Permission mode]:mode:(default acceptEdits plan bypassPermissions)' \\
-            '--permission-mode[Permission mode]:mode:(default acceptEdits plan bypassPermissions)' \\
-            '-e[Effort level]:level:(low medium high xhigh max)' \\
-            '--effort[Effort level]:level:(low medium high xhigh max)' \\
-            '--settings[Settings file]:file:_files' \\
-            '--mcp-config[MCP config files]:file:_files' \\
-            '--extra-args[Extra arguments]' \\
-            '-f[Force restart]' \\
-            '--force[Force restart]' \\
-            '1: :->session_names'
-          ;;
-        stop)
-          _arguments \\
-            '--remove[Also remove from managed list]' \\
-            '--all[Stop all sessions]' \\
-            '1:session:->session_names'
-          ;;
-        attach|config|restart|rename)
-          _arguments '1:session:->session_names'
-          ;;
-      esac
-      ;;
-    session_names)
-      if [[ -n \\\${session_names} ]]; then
-        _describe 'session' session_names
-      fi
-      ;;
-  esac
-}
-
-_multi_claude "\$@"
-`);
+      console.log(generateZshCompletion());
     } else {
-      console.log(`# shellcheck shell=bash
-# Generated by: multi-claude completion bash
-# Source in ~/.bashrc: source <(multi-claude completion bash)
-
-_multi_claude_completion() {
-  local cur prev words cword
-  _init_completion || return
-
-  local opts="start stop list attach config restart rename kill-all models completion"
-  local sessions
-  sessions=\\$(node -e "try{const s=require('os').homedir()+'/.multi-claude/sessions.json';const d=require('fs').readFileSync(s,'utf8');const j=JSON.parse(d);console.log(Object.keys(j.sessions||{}).join(' '));}catch(e){}" 2>/dev/null)
-
-  case \\\${prev} in
-    start)
-      if [[ \\\${cur} == -* ]]; then
-        COMPREPLY=( \\$(compgen -W "-m --model -d --dir -s --system-prompt -p --permission-mode -e --effort --settings --mcp-config --extra-args -f --force" -- "\\\${cur}") )
-      else
-        COMPREPLY=( \\$(compgen -W "\\\${sessions}" -- "\\\${cur}") )
-      fi
-      return 0
-      ;;
-    stop|attach|config|restart|rename)
-      COMPREPLY=( \\$(compgen -W "\\\${sessions}" -- "\\\${cur}") )
-      return 0
-      ;;
-    stop)
-      if [[ \\\${cur} == -* ]]; then
-        COMPREPLY=( \\$(compgen -W "--remove --all" -- "\\\${cur}") )
-      else
-        COMPREPLY=( \\$(compgen -W "\\\${sessions}" -- "\\\${cur}") )
-      fi
-      return 0
-      ;;
-    -m|--model|-d|--dir|-p|--permission-mode|-e|--effort|--settings|--mcp-config)
-      return 0
-      ;;
-  esac
-
-  COMPREPLY=( \\$(compgen -W "\\\${opts}" -- "\\\${cur}") )
-  return 0
-}
-
-complete -F _multi_claude_completion multi-claude
-`);
+      console.log(generateBashCompletion());
     }
   });
 
