@@ -37,6 +37,7 @@ exports.loadSessions = loadSessions;
 exports.saveSessions = saveSessions;
 exports.addSession = addSession;
 exports.removeSession = removeSession;
+exports.renameSession = renameSession;
 exports.updateSessionStatus = updateSessionStatus;
 exports.getSession = getSession;
 exports.getAllSessions = getAllSessions;
@@ -86,6 +87,19 @@ function removeSession(name) {
     if (!store.sessions[name])
         return false;
     delete store.sessions[name];
+    saveSessions(store);
+    return true;
+}
+function renameSession(oldName, newName) {
+    const store = loadSessions();
+    if (!store.sessions[oldName] || store.sessions[newName])
+        return false;
+    store.sessions[newName] = {
+        ...store.sessions[oldName],
+        name: newName,
+        config: { ...store.sessions[oldName].config, name: newName },
+    };
+    delete store.sessions[oldName];
     saveSessions(store);
     return true;
 }

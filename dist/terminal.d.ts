@@ -16,6 +16,10 @@ export declare function startSession(config: SessionConfig): {
  */
 export declare function stopSession(name: string): boolean;
 /**
+ * Rename a tmux window within the multi-claude session.
+ */
+export declare function renameWindow(oldName: string, newName: string): boolean;
+/**
  * Attach to the tmux session (default: attach to last active window).
  * If windowName is specified, select that window first.
  */

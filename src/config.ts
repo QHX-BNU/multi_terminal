@@ -56,6 +56,19 @@ export function removeSession(name: string): boolean {
   return true;
 }
 
+export function renameSession(oldName: string, newName: string): boolean {
+  const store = loadSessions();
+  if (!store.sessions[oldName] || store.sessions[newName]) return false;
+  store.sessions[newName] = {
+    ...store.sessions[oldName],
+    name: newName,
+    config: { ...store.sessions[oldName].config, name: newName },
+  };
+  delete store.sessions[oldName];
+  saveSessions(store);
+  return true;
+}
+
 export function updateSessionStatus(name: string, status: 'running' | 'stopped'): void {
   const store = loadSessions();
   if (store.sessions[name]) {

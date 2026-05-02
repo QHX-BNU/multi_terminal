@@ -2,7 +2,7 @@
 
 import { Command } from 'commander';
 import * as path from 'path';
-import { execSync } from 'child_process';
+import { spawnSync } from 'child_process';
 import {
   loadSessions,
   saveSessions,
@@ -11,6 +11,7 @@ import {
   getSession,
   getAllSessions,
   updateSessionStatus,
+  renameSession,
 } from './config';
 import {
   startSession,
@@ -18,8 +19,13 @@ import {
   attachSession,
   isSessionAlive,
   listRunningWindows,
+  renameWindow,
 } from './terminal';
 import { SessionConfig } from './types';
+
+const RESET = '\x1b[0m';
+const GREEN = '\x1b[32m';
+const RED = '\x1b[31m';
 
 const program = new Command();
 
@@ -43,11 +49,17 @@ program
   .option('--settings <file>', 'Path to settings JSON file for custom API providers/endpoints')
   .option('--mcp-config <configs...>', 'MCP server config files (space-separated)')
   .option('--extra-args <args...>', 'Extra arguments to pass to claude')
+  .option('-f, --force', 'Force restart if session is already running')
   .action((name: string, options: Record<string, any>) => {
     const existing = getSession(name);
     if (existing && isSessionAlive(name)) {
-      console.log(`Session "${name}" is already running. Use "multi-claude attach ${name}" to connect.`);
-      return;
+      if (options.force) {
+        console.log(`Session "${name}" is already running. Force-restarting...`);
+        stopSession(name);
+      } else {
+        console.log(`Session "${name}" is already running. Use "multi-claude attach ${name}" to connect, or --force to restart.`);
+        return;
+      }
     }
 
     const prev = existing?.config;
@@ -150,7 +162,7 @@ program
 
     for (const s of sessions) {
       const alive = runningWindows.includes(s.name);
-      const status = alive ? '▶ running' : '■ stopped';
+      const status = alive ? `${GREEN}▶ running${RESET}` : `${RED}■ stopped${RESET}`;
       const model = s.config.model || '(default)';
       const workDir = s.config.workingDir || '(unknown)';
 
@@ -295,6 +307,31 @@ program
     console.log(`  Model       : ${session.config.model || '(default)'}`);
   });
 
+// ─── rename ──────────────────────────────────────────────────────────────────
+
+program
+  .command('rename <oldName> <newName>')
+  .description('Rename a session (and its tmux window if running)')
+  .action((oldName: string, newName: string) => {
+    const session = getSession(oldName);
+    if (!session) {
+      console.log(`No session named "${oldName}" found.`);
+      return;
+    }
+    if (getSession(newName)) {
+      console.log(`Session "${newName}" already exists.`);
+      return;
+    }
+
+    const wasRunning = isSessionAlive(oldName);
+    if (wasRunning) {
+      renameWindow(oldName, newName);
+    }
+
+    renameSession(oldName, newName);
+    console.log(`Session renamed: "${oldName}" → "${newName}"${wasRunning ? ` ${GREEN}(running)${RESET}` : ''}`);
+  });
+
 // ─── kill-all ────────────────────────────────────────────────────────────────
 
 program
@@ -310,11 +347,7 @@ program
       count++;
     }
 
-    try {
-      execSync(`tmux kill-session -t "multi-claude" 2>/dev/null`, { stdio: 'ignore' });
-    } catch {
-      // Already gone
-    }
+    spawnSync('tmux', ['kill-session', '-t', 'multi-claude'], { stdio: 'ignore' });
 
     for (const key of Object.keys(store.sessions)) {
       store.sessions[key].status = 'stopped';

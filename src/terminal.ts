@@ -1,4 +1,4 @@
-import { spawnSync, execSync } from 'child_process';
+import { spawnSync } from 'child_process';
 import { SessionConfig } from './types';
 
 const TMUX_SESSION_PREFIX = 'multi-claude';
@@ -44,12 +44,8 @@ export function buildClaudeArgs(config: SessionConfig): string[] {
  * Check whether a tmux session/window exists.
  */
 function tmuxHasWindow(windowName: string): boolean {
-  try {
-    execSync(`tmux has-session -t "${windowName}" 2>/dev/null`, { stdio: 'ignore' });
-    return true;
-  } catch {
-    return false;
-  }
+  const result = spawnSync('tmux', ['has-session', '-t', windowName], { stdio: 'ignore' });
+  return result.status === 0;
 }
 
 /**
@@ -110,19 +106,23 @@ export function stopSession(name: string): boolean {
   tmux(['kill-window', '-t', windowName]);
 
   // If no more windows in the session, kill the session too
-  try {
-    const windows = execSync(
-      `tmux list-windows -t "${TMUX_SESSION_PREFIX}" -F '#{window_name}' 2>/dev/null`,
-      { encoding: 'utf-8' },
-    ).trim();
-    if (!windows || windows.split('\n').filter(Boolean).length === 0) {
-      tmux(['kill-session', '-t', TMUX_SESSION_PREFIX]);
-    }
-  } catch {
-    // Session already gone
+  const listResult = spawnSync('tmux', ['list-windows', '-t', TMUX_SESSION_PREFIX, '-F', '#{window_name}'], { encoding: 'utf-8' });
+  const windows = (listResult.stdout || '').trim();
+  if (listResult.status !== 0 || !windows || windows.split('\n').filter(Boolean).length === 0) {
+    tmux(['kill-session', '-t', TMUX_SESSION_PREFIX]);
   }
 
   return true;
+}
+
+/**
+ * Rename a tmux window within the multi-claude session.
+ */
+export function renameWindow(oldName: string, newName: string): boolean {
+  const oldWindow = `${TMUX_SESSION_PREFIX}:${oldName}`;
+  if (!tmuxHasWindow(oldWindow)) return false;
+  const result = spawnSync('tmux', ['rename-window', '-t', oldWindow, newName], { stdio: 'ignore' });
+  return result.status === 0;
 }
 
 /**
@@ -130,12 +130,11 @@ export function stopSession(name: string): boolean {
  * If windowName is specified, select that window first.
  */
 export function attachSession(windowName?: string): void {
-  try {
-    if (windowName) {
-      execSync(`tmux select-window -t "${windowName}" 2>/dev/null`, { stdio: 'ignore' });
-    }
-    execSync(`tmux attach-session -t "${TMUX_SESSION_PREFIX}"`, { stdio: 'inherit' });
-  } catch {
+  if (windowName) {
+    spawnSync('tmux', ['select-window', '-t', windowName], { stdio: 'ignore' });
+  }
+  const result = spawnSync('tmux', ['attach-session', '-t', TMUX_SESSION_PREFIX], { stdio: 'inherit' });
+  if (result.status !== 0) {
     console.error('Failed to attach to tmux session. Is tmux running?');
     process.exit(1);
   }
@@ -152,13 +151,8 @@ export function isSessionAlive(name: string): boolean {
  * List all running tmux windows for our session.
  */
 export function listRunningWindows(): string[] {
-  try {
-    const output = execSync(
-      `tmux list-windows -t "${TMUX_SESSION_PREFIX}" -F '#{window_name}' 2>/dev/null`,
-      { encoding: 'utf-8' },
-    ).trim();
-    return output ? output.split('\n').filter(Boolean) : [];
-  } catch {
-    return [];
-  }
+  const result = spawnSync('tmux', ['list-windows', '-t', TMUX_SESSION_PREFIX, '-F', '#{window_name}'], { encoding: 'utf-8' });
+  if (result.status !== 0) return [];
+  const output = (result.stdout || '').trim();
+  return output ? output.split('\n').filter(Boolean) : [];
 }
