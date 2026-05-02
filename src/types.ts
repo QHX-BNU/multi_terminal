@@ -13,10 +13,8 @@ export interface SessionConfig {
 }
 
 export interface SessionState {
-  name: string;
   status: 'running' | 'stopped';
   tmuxWindow: string;
-  pid?: number;
   config: SessionConfig;
 }
 

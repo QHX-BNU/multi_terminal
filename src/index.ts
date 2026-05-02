@@ -79,13 +79,12 @@ program
 
     console.log(`Starting session "${name}"${config.model ? ` with model "${config.model}"` : ''}...`);
 
-    const { pid, tmuxWindow } = startSession(config);
+    const { tmuxWindow } = startSession(config);
 
-    addSession({ name, status: 'running', tmuxWindow, pid, config });
+    addSession({ status: 'running', tmuxWindow, config });
 
     console.log(`Session "${name}" started successfully.`);
     console.log(`  Tmux window : ${tmuxWindow}`);
-    console.log(`  PID         : ${pid}`);
     console.log(`  Model       : ${config.model || '(default)'}`);
     console.log(`  Work dir    : ${config.workingDir}`);
     console.log();
@@ -127,11 +126,14 @@ program
   .command('list')
   .description('List all managed Claude Code sessions')
   .action(() => {
-    const sessions = getAllSessions();
+    const store = loadSessions();
+    const sessions = Object.entries(store.sessions).map(([name, state]) => ({
+      ...state,
+      name,
+    }));
     const runningWindows = listRunningWindows();
 
     // Sync status of all sessions in a single read-modify-write cycle
-    const store = loadSessions();
     let changed = false;
     for (const s of sessions) {
       const alive = runningWindows.includes(s.name);
@@ -162,12 +164,14 @@ program
 
     for (const s of sessions) {
       const alive = runningWindows.includes(s.name);
-      const status = alive ? `${GREEN}▶ running${RESET}` : `${RED}■ stopped${RESET}`;
+      const color = alive ? GREEN : RED;
+      const plainStatus = alive ? '▶ running' : '■ stopped';
+      const status = `${color}${plainStatus.padEnd(10)}${RESET}`;
       const model = s.config.model || '(default)';
       const workDir = s.config.workingDir || '(unknown)';
 
       console.log(
-        `${s.name.padEnd(nameWidth)}  ${status.padEnd(10)}  ${model.padEnd(20)}  ${workDir}`,
+        `${s.name.padEnd(nameWidth)}  ${status}  ${model.padEnd(20)}  ${workDir}`,
       );
     }
 
@@ -184,55 +188,35 @@ program
   .command('attach [name]')
   .description('Attach to the multi-claude tmux session (or a specific window)')
   .action((name?: string) => {
-    if (name) {
-      const session = getSession(name);
-      if (!session && !isSessionAlive(name)) {
-        console.log(`No session named "${name}" found.`);
-        console.log('Available sessions:');
-        const sessions = getAllSessions();
-        if (sessions.length === 0) {
-          console.log('  (none)');
-        } else {
-          sessions.forEach(s => console.log(`  ${s.name}`));
+    try {
+      if (name) {
+        const session = getSession(name);
+        if (!session && !isSessionAlive(name)) {
+          console.log(`No session named "${name}" found.`);
+          console.log('Available sessions:');
+          const sessions = getAllSessions();
+          if (sessions.length === 0) {
+            console.log('  (none)');
+          } else {
+            sessions.forEach(s => console.log(`  ${s.name}`));
+          }
+          return;
         }
-        return;
+        attachSession(session?.tmuxWindow || `multi-claude:${name}`);
+      } else {
+        attachSession();
       }
-      attachSession(session?.tmuxWindow || `multi-claude:${name}`);
-    } else {
-      attachSession();
+    } catch (err: any) {
+      console.error(err.message);
+      process.exit(1);
     }
   });
 
-// ─── config-show ─────────────────────────────────────────────────────────────
+// ─── config ───────────────────────────────────────────────────────────────────
 
 program
-  .command('config-show <name>')
-  .description('Show session configuration')
-  .action((name: string) => {
-    const session = getSession(name);
-    if (!session) {
-      console.log(`No session named "${name}" found.`);
-      return;
-    }
-    const cfg = session.config;
-    console.log(`Configuration for "${name}":`);
-    console.log(`  Model          : ${cfg.model || '(default)'}`);
-    console.log(`  Working Dir    : ${cfg.workingDir || '(not set)'}`);
-    console.log(`  Permission Mode: ${cfg.permissionMode || '(default)'}`);
-    console.log(`  Effort         : ${cfg.effort || '(default)'}`);
-    console.log(`  Settings File  : ${cfg.settingsFile || '(none)'}`);
-    console.log(`  MCP Configs    : ${cfg.mcpConfig?.join(', ') || '(none)'}`);
-    console.log(`  System Prompt  : ${cfg.systemPrompt ? '(set)' : '(none)'}`);
-    console.log(`  Extra Args     : ${cfg.extraArgs?.join(' ') || '(none)'}`);
-    console.log(`  Created At     : ${cfg.createdAt}`);
-    console.log(`  Last Started   : ${cfg.lastStartedAt || '(never)'}`);
-  });
-
-// ─── config-set ──────────────────────────────────────────────────────────────
-
-program
-  .command('config-set <name>')
-  .description('Update session configuration (requires restart to take effect)')
+  .command('config <name>')
+  .description('Show or update session configuration')
   .option('-m, --model <model>', 'Change LLM model')
   .option('-d, --dir <path>', 'Change working directory')
   .option('-s, --system-prompt <prompt>', 'Change system prompt')
@@ -241,6 +225,7 @@ program
   .option('--settings <file>', 'Change settings JSON file for custom API providers')
   .option('--mcp-config <configs...>', 'Change MCP server config files')
   .option('--extra-args <args...>', 'Change extra arguments passed to claude')
+  .option('--unset <fields...>', 'Unset configuration fields (model, workingDir, systemPrompt, permissionMode, effort, settingsFile, mcpConfig, extraArgs)')
   .action((name: string, options: Record<string, any>) => {
     const session = getSession(name);
     if (!session) {
@@ -248,17 +233,65 @@ program
       return;
     }
 
-    const cfg = session.config;
-    if (options.model) cfg.model = options.model;
-    if (options.dir) cfg.workingDir = path.resolve(options.dir);
-    if (options.systemPrompt) cfg.systemPrompt = options.systemPrompt;
-    if (options.permissionMode) cfg.permissionMode = options.permissionMode;
-    if (options.effort) cfg.effort = options.effort;
-    if (options.settings) cfg.settingsFile = options.settings;
-    if (options.mcpConfig) cfg.mcpConfig = options.mcpConfig;
-    if (options.extraArgs) cfg.extraArgs = options.extraArgs;
+    const isModifying =
+      options.model !== undefined ||
+      options.dir !== undefined ||
+      options.systemPrompt !== undefined ||
+      options.permissionMode !== undefined ||
+      options.effort !== undefined ||
+      options.settings !== undefined ||
+      options.mcpConfig !== undefined ||
+      options.extraArgs !== undefined ||
+      options.unset !== undefined;
 
-    addSession({ ...session, config: cfg });
+    const cfg = session.config;
+
+    if (!isModifying) {
+      console.log(`Configuration for "${name}":`);
+      console.log(`  Model          : ${cfg.model || '(default)'}`);
+      console.log(`  Working Dir    : ${cfg.workingDir || '(not set)'}`);
+      console.log(`  Permission Mode: ${cfg.permissionMode || '(default)'}`);
+      console.log(`  Effort         : ${cfg.effort || '(default)'}`);
+      console.log(`  Settings File  : ${cfg.settingsFile || '(none)'}`);
+      console.log(`  MCP Configs    : ${cfg.mcpConfig?.join(', ') || '(none)'}`);
+      console.log(`  System Prompt  : ${cfg.systemPrompt ? '(set)' : '(none)'}`);
+      console.log(`  Extra Args     : ${cfg.extraArgs?.join(' ') || '(none)'}`);
+      console.log(`  Created At     : ${cfg.createdAt}`);
+      console.log(`  Last Started   : ${cfg.lastStartedAt || '(never)'}`);
+      return;
+    }
+
+    if (options.model !== undefined) cfg.model = options.model || undefined;
+    if (options.dir !== undefined) cfg.workingDir = options.dir ? path.resolve(options.dir) : undefined;
+    if (options.systemPrompt !== undefined) cfg.systemPrompt = options.systemPrompt || undefined;
+    if (options.permissionMode !== undefined) cfg.permissionMode = options.permissionMode || undefined;
+    if (options.effort !== undefined) cfg.effort = options.effort || undefined;
+    if (options.settings !== undefined) cfg.settingsFile = options.settings || undefined;
+    if (options.mcpConfig !== undefined) cfg.mcpConfig = options.mcpConfig.length > 0 ? options.mcpConfig : undefined;
+    if (options.extraArgs !== undefined) cfg.extraArgs = options.extraArgs.length > 0 ? options.extraArgs : undefined;
+
+    if (options.unset) {
+      const unsetMap: Record<string, string> = {
+        model: 'model',
+        workingDir: 'workingDir',
+        systemPrompt: 'systemPrompt',
+        permissionMode: 'permissionMode',
+        effort: 'effort',
+        settingsFile: 'settingsFile',
+        mcpConfig: 'mcpConfig',
+        extraArgs: 'extraArgs',
+      };
+      for (const field of options.unset) {
+        const key = unsetMap[field];
+        if (key) {
+          (cfg as any)[key] = undefined;
+        } else {
+          console.log(`Unknown config field "${field}". Valid fields: ${Object.keys(unsetMap).join(', ')}`);
+        }
+      }
+    }
+
+    addSession({ status: session.status, tmuxWindow: session.tmuxWindow, config: cfg });
 
     console.log(`Configuration for "${name}" updated:`);
     console.log(`  Model          : ${cfg.model || '(default)'}`);
@@ -292,13 +325,11 @@ program
       stopSession(name);
     }
 
-    const { pid, tmuxWindow } = startSession(session.config);
+    const { tmuxWindow } = startSession(session.config);
 
     addSession({
-      name,
       status: 'running',
       tmuxWindow,
-      pid,
       config: { ...session.config, lastStartedAt: new Date().toISOString() },
     });
 

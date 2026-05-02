@@ -44,7 +44,7 @@ export function saveSessions(store: SessionsStore): void {
 
 export function addSession(state: SessionState): void {
   const store = loadSessions();
-  store.sessions[state.name] = state;
+  store.sessions[state.config.name] = state;
   saveSessions(store);
 }
 
@@ -61,7 +61,6 @@ export function renameSession(oldName: string, newName: string): boolean {
   if (!store.sessions[oldName] || store.sessions[newName]) return false;
   store.sessions[newName] = {
     ...store.sessions[oldName],
-    name: newName,
     config: { ...store.sessions[oldName].config, name: newName },
   };
   delete store.sessions[oldName];
@@ -82,7 +81,10 @@ export function getSession(name: string): SessionState | undefined {
   return store.sessions[name];
 }
 
-export function getAllSessions(): SessionState[] {
+export function getAllSessions(): (SessionState & { name: string })[] {
   const store = loadSessions();
-  return Object.values(store.sessions);
+  return Object.entries(store.sessions).map(([name, state]) => ({
+    ...state,
+    name,
+  }));
 }

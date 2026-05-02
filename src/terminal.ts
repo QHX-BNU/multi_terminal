@@ -60,7 +60,7 @@ function tmux(args: string[]): void {
  * Start a new Claude Code session inside a tmux window.
  * Uses tmux send-keys to avoid shell injection through tmux new-window's shell command argument.
  */
-export function startSession(config: SessionConfig): { pid: number; tmuxWindow: string } {
+export function startSession(config: SessionConfig): { tmuxWindow: string } {
   const windowName = `${TMUX_SESSION_PREFIX}:${config.name}`;
   const workDir = config.workingDir || process.cwd();
 
@@ -85,15 +85,7 @@ export function startSession(config: SessionConfig): { pid: number; tmuxWindow: 
   // Send the command to the window as literal keystrokes (no shell interpretation in our process)
   spawnSync('tmux', ['send-keys', '-l', '-t', windowName, cmdLine], { stdio: 'ignore' });
 
-  // Get the PID of the shell in the new window
-  const result = spawnSync('tmux', ['display-message', '-t', windowName, '-p', '#{pane_pid}'], {
-    encoding: 'utf-8',
-  });
-
-  const pidStr = (result.stdout || '').trim();
-  const pid = parseInt(pidStr, 10);
-
-  return { pid: isNaN(pid) ? 0 : pid, tmuxWindow: windowName };
+  return { tmuxWindow: windowName };
 }
 
 /**
@@ -135,8 +127,7 @@ export function attachSession(windowName?: string): void {
   }
   const result = spawnSync('tmux', ['attach-session', '-t', TMUX_SESSION_PREFIX], { stdio: 'inherit' });
   if (result.status !== 0) {
-    console.error('Failed to attach to tmux session. Is tmux running?');
-    process.exit(1);
+    throw new Error('Failed to attach to tmux session. Is tmux running?');
   }
 }
 
