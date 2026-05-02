@@ -19,8 +19,9 @@ _multi_claude() {
     'restart:Restart a session'
     'rename:Rename a session'
     'duplicate:Clone a session configuration'
+    'init:Initialize sessions for detected LLM providers'
     'kill-all:Stop all sessions and kill the tmux session'
-    'models:List common model aliases'
+    'models:List available models by provider'
     'logs:Show recent output from a session'
     'completion:Generate shell completion script'
   )
@@ -42,6 +43,7 @@ _multi_claude() {
           _arguments \\
             '-m[LLM model]:model:()' \\
             '--model[LLM model]:model:()' \\
+            '--provider[LLM provider]:provider:(anthropic openai gemini groq deepseek openrouter ollama together)' \\
             '-d[Working directory]:dir:_directories' \\
             '--dir[Working directory]:dir:_directories' \\
             '--desc[Session description]' \\
@@ -59,6 +61,14 @@ _multi_claude() {
             '--all[Start all stopped sessions]' \\
             '1: :->session_names'
           ;;
+        init)
+          _arguments \\
+            '--providers[Specific providers]:provider:_values -s , provider anthropic openai gemini groq deepseek openrouter ollama together' \\
+            '--list[List available providers]' \\
+            '--no-start[Create configs without starting]' \\
+            '--force[Overwrite existing configs]' \\
+            '--json[Output as JSON]'
+          ;;
         stop)
           _arguments \\
             '--remove[Also remove from managed list]' \\
@@ -67,6 +77,11 @@ _multi_claude() {
           ;;
         attach|config|restart|rename|duplicate|logs)
           _arguments '1:session:->session_names'
+          ;;
+        init|models)
+          _arguments
+            '--provider[Filter by provider]:provider:(anthropic openai gemini groq deepseek openrouter ollama together)'
+            '--json[Output as JSON]'
           ;;
       esac
       ;;
@@ -91,14 +106,14 @@ _multi_claude_completion() {
   local cur prev words cword
   _init_completion || return
 
-  local opts="start stop list attach config restart rename duplicate kill-all models logs completion"
+  local opts="start stop list attach config restart rename duplicate init kill-all models logs completion"
   local sessions
   sessions=\\$(node -e "try{const s=require('os').homedir()+'/.multi-claude/sessions.json';const d=require('fs').readFileSync(s,'utf8');const j=JSON.parse(d);console.log(Object.keys(j.sessions||{}).join(' '));}catch(e){}" 2>/dev/null)
 
   case \\\${prev} in
     start)
       if [[ \\\${cur} == -* ]]; then
-        COMPREPLY=( \\$(compgen -W "-m --model -d --dir --desc -s --system-prompt -p --permission-mode -e --effort --settings --mcp-config --extra-args -f --force --all" -- "\\\${cur}") )
+        COMPREPLY=( \\$(compgen -W "-m --model --provider -d --dir --desc -s --system-prompt -p --permission-mode -e --effort --settings --mcp-config --extra-args -f --force --all" -- "\\\${cur}") )
       else
         COMPREPLY=( \\$(compgen -W "\\\${sessions}" -- "\\\${cur}") )
       fi

@@ -1,7 +1,11 @@
 import { spawnSync } from 'child_process';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
 import { SessionConfig } from './types';
 
 export const TMUX_SESSION_PREFIX = 'multi-claude';
+export const SETTINGS_DIR = path.join(os.homedir(), '.multi-claude', 'settings');
 
 const VALID_SESSION_NAME = /^[a-zA-Z0-9][-a-zA-Z0-9_]*$/;
 
@@ -185,6 +189,16 @@ export function listRunningWindows(): string[] {
   if (result.status !== 0) return [];
   const output = (result.stdout || '').trim();
   return output ? output.split('\n').filter(Boolean) : [];
+}
+
+/**
+ * Resolve the settings file path for a given provider ID.
+ * Returns undefined for Anthropic (no settings needed) or if the file doesn't exist.
+ */
+export function resolveProviderSettings(providerId: string): string | undefined {
+  if (providerId === 'anthropic') return undefined;
+  const filePath = path.join(SETTINGS_DIR, `${providerId}.json`);
+  return fs.existsSync(filePath) ? filePath : undefined;
 }
 
 /**

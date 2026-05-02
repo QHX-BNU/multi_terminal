@@ -9,8 +9,16 @@ export interface SessionConfig {
   settingsFile?: string;
   mcpConfig?: string[];
   extraArgs?: string[];
+  provider?: string;
   createdAt: string;
   lastStartedAt?: string;
+}
+
+export interface InitResult {
+  provider: string;
+  sessionName: string;
+  settingsFile?: string;
+  apiKeySet: boolean;
 }
 
 export interface SessionState {

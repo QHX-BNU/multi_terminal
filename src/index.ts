@@ -24,10 +24,19 @@ import {
   checkClaudeCli,
   validateSessionName,
   capturePane,
+  resolveProviderSettings,
   TMUX_SESSION_PREFIX,
 } from './terminal';
-import { SessionConfig } from './types';
+import { SessionConfig, InitResult } from './types';
 import { generateZshCompletion, generateBashCompletion } from './completion';
+import {
+  PROVIDER_PRESETS,
+  getProvider,
+  detectProviders,
+  generateSettingsFile,
+  ensureSettingsFiles,
+  sessionNameForProvider,
+} from './providers';
 
 const RESET = '\x1b[0m';
 const GREEN = '\x1b[32m';
@@ -63,7 +72,8 @@ if (!checkClaudeCli()) {
 program
   .command('start [name]')
   .description('Start a new Claude Code session in a tmux window')
-  .option('-m, --model <model>', 'LLM model alias or full name (e.g. sonnet, opus, claude-sonnet-4-6)')
+  .option('-m, --model <model>', 'LLM model alias or full name (e.g. sonnet, opus, gpt-4.1)')
+  .option('--provider <id>', 'LLM provider preset (anthropic, openai, gemini, groq, deepseek, openrouter, ollama, together)')
   .option('-d, --dir <path>', 'Working directory for the session')
   .option('--desc <description>', 'Description or notes for the session')
   .option('-s, --system-prompt <prompt>', 'Custom system prompt')
@@ -114,22 +124,48 @@ program
     }
 
     const prev = existing?.config;
+
+    // Resolve provider: --provider flag, or reuse previously saved provider
+    const providerId = options.provider ?? prev?.provider;
+    if (providerId && !getProvider(providerId)) {
+      console.error(`Unknown provider "${providerId}". Available: ${PROVIDER_PRESETS.map(p => p.id).join(', ')}`);
+      process.exit(1);
+    }
+
+    // Resolve settings file: explicit --settings wins, then --provider, then prev
+    let settingsFile = options.settings ?? prev?.settingsFile;
+    if (!settingsFile && providerId) {
+      if (providerId !== 'anthropic') {
+        ensureSettingsFiles([providerId]);
+        settingsFile = resolveProviderSettings(providerId);
+      }
+    }
+
+    // Resolve model: explicit --model wins, then provider default, then prev
+    let model = options.model ?? prev?.model;
+    if (!model && providerId) {
+      const prov = getProvider(providerId);
+      if (prov) model = prov.defaultModel;
+    }
+
     const config: SessionConfig = {
       name,
-      model: options.model ?? prev?.model,
+      model,
       workingDir: options.dir ? path.resolve(options.dir) : (prev?.workingDir ?? process.cwd()),
       description: options.desc ?? prev?.description,
       systemPrompt: options.systemPrompt ?? prev?.systemPrompt,
       permissionMode: options.permissionMode ?? prev?.permissionMode,
       effort: options.effort ?? prev?.effort,
-      settingsFile: options.settings ?? prev?.settingsFile,
+      settingsFile,
       mcpConfig: options.mcpConfig ?? prev?.mcpConfig,
       extraArgs: options.extraArgs ?? prev?.extraArgs,
+      provider: providerId ?? prev?.provider,
       createdAt: prev?.createdAt || new Date().toISOString(),
       lastStartedAt: new Date().toISOString(),
     };
 
-    console.log(`Starting session "${name}"${config.model ? ` with model "${config.model}"` : ''}...`);
+    const providerLabel = config.provider ? ` [${config.provider}]` : '';
+    console.log(`Starting session "${name}"${providerLabel}${config.model ? ` with model "${config.model}"` : ''}...`);
 
     const { tmuxWindow } = startSession(config);
 
@@ -142,6 +178,131 @@ program
     if (config.description) console.log(`  Description : ${config.description}`);
     console.log();
     console.log(`Use "multi-claude attach ${name}" to connect, or "tmux attach -t multi-claude" to see all sessions.`);
+  });
+
+// ─── init ────────────────────────────────────────────────────────────────────
+
+program
+  .command('init')
+  .description('Initialize sessions for detected LLM providers')
+  .option('--providers <ids...>', 'Specific providers to set up (e.g. openai gemini groq)')
+  .option('--list', 'List available provider presets')
+  .option('--no-start', 'Create session configs without starting them')
+  .option('--force', 'Overwrite existing settings files and session configs')
+  .option('--json', 'Output results as JSON')
+  .action((options: Record<string, any>) => {
+    if (options.list) {
+      console.log('Available LLM provider presets:\n');
+      const nameWidth = 12;
+      const envWidth = 24;
+      console.log(`${'PROVIDER'.padEnd(nameWidth)}  ${'ENV VAR'.padEnd(envWidth)}  ${'DEFAULT MODEL'}`);
+      console.log(`${'-'.repeat(nameWidth)}  ${'-'.repeat(envWidth)}  ${'-'.repeat(30)}`);
+      for (const p of PROVIDER_PRESETS) {
+        const envVar = p.envVar || '(none — local)';
+        const builtin = p.builtin ? ' (built-in)' : '';
+        console.log(`${p.id.padEnd(nameWidth)}  ${envVar.padEnd(envWidth)}  ${p.defaultModel}${builtin}`);
+      }
+      console.log();
+      console.log('Set the corresponding API key environment variable before running init.');
+      console.log('Example: export OPENAI_API_KEY=sk-...');
+      return;
+    }
+
+    const providerIds = options.providers
+      ? options.providers
+      : detectProviders().map(p => p.id);
+
+    if (providerIds.length === 0) {
+      console.log('No LLM providers detected.');
+      console.log();
+      console.log('Set at least one API key environment variable:');
+      for (const p of PROVIDER_PRESETS) {
+        if (p.envVar) console.log(`  export ${p.envVar}=<your-api-key>`);
+      }
+      console.log();
+      console.log('Or specify providers manually:');
+      console.log('  multi-claude init --providers openai gemini');
+      console.log();
+      console.log('See available providers:');
+      console.log('  multi-claude init --list');
+      return;
+    }
+
+    const results: InitResult[] = [];
+    const store = loadSessions();
+
+    for (const id of providerIds) {
+      const provider = getProvider(id);
+      if (!provider) {
+        console.error(`Unknown provider "${id}". Skipping.`);
+        continue;
+      }
+
+      const apiKeySet = provider.envVar ? !!process.env[provider.envVar] : true;
+      if (!apiKeySet && !provider.builtin) {
+        console.log(`Warning: ${provider.envVar} is not set. Provider "${id}" may not work.`);
+      }
+
+      // Generate settings file for non-builtin providers
+      let settingsFile: string | undefined;
+      if (!provider.builtin) {
+        settingsFile = generateSettingsFile(provider);
+        console.log(`Generated settings file: ${settingsFile}`);
+      }
+
+      const sessionName = sessionNameForProvider(id);
+      const existing = store.sessions[sessionName];
+
+      if (existing && !options.force) {
+        console.log(`Session "${sessionName}" already exists. Use --force to overwrite.`);
+        continue;
+      }
+
+      const config: SessionConfig = {
+        name: sessionName,
+        model: provider.defaultModel,
+        workingDir: process.cwd(),
+        description: `Claude Code with ${provider.name}`,
+        settingsFile,
+        provider: id,
+        createdAt: new Date().toISOString(),
+        lastStartedAt: undefined,
+      };
+
+      if (!options.noStart) {
+        if (isSessionAlive(sessionName)) stopSession(sessionName);
+        const { tmuxWindow } = startSession(config);
+        addSession({ status: 'running', tmuxWindow, config });
+        console.log(`Started session "${sessionName}" [${provider.name}] with model "${provider.defaultModel}"`);
+      } else {
+        addSession({ status: 'stopped', tmuxWindow: `multi-claude:${sessionName}`, config });
+        console.log(`Created session "${sessionName}" [${provider.name}] (stopped — use "multi-claude start ${sessionName}" to run)`);
+      }
+
+      results.push({ provider: id, sessionName, settingsFile, apiKeySet });
+    }
+
+    if (options.json) {
+      console.log(JSON.stringify(results, null, 2));
+      return;
+    }
+
+    console.log();
+    console.log(`Initialized ${results.length} session(s).`);
+    console.log('Use "multi-claude list" to see all sessions.');
+    console.log('Use "multi-claude attach <name>" to connect to a session.');
+
+    // Warn about missing API keys
+    const missing = results.filter(r => !r.apiKeySet);
+    if (missing.length > 0) {
+      console.log();
+      console.log('Warning: The following sessions have no API key set:');
+      for (const r of missing) {
+        const prov = getProvider(r.provider);
+        const envVar = prov?.envVar || '';
+        console.log(`  ${r.sessionName} — set ${envVar} before starting`);
+      }
+    }
   });
 
 // ─── stop ────────────────────────────────────────────────────────────────────
@@ -248,12 +409,13 @@ program
     console.log(`Managed Claude Code sessions${options.filter ? ` (${options.filter})` : ''}:\n`);
 
     const nameWidth = Math.max(20, ...filtered.map(s => s.name.length));
+    const provWidth = 12;
     const descWidth = 24;
     console.log(
-      `${'NAME'.padEnd(nameWidth)}  ${'STATUS'.padEnd(10)}  ${'MODEL'.padEnd(20)}  ${'DESCRIPTION'.padEnd(descWidth)}  ${'WORK DIR'}`,
+      `${'NAME'.padEnd(nameWidth)}  ${'STATUS'.padEnd(10)}  ${'PROVIDER'.padEnd(provWidth)}  ${'MODEL'.padEnd(20)}  ${'DESCRIPTION'.padEnd(descWidth)}  ${'WORK DIR'}`,
     );
     console.log(
-      `${'-'.repeat(nameWidth)}  ${'-'.repeat(10)}  ${'-'.repeat(20)}  ${'-'.repeat(descWidth)}  ${'-'.repeat(40)}`,
+      `${'-'.repeat(nameWidth)}  ${'-'.repeat(10)}  ${'-'.repeat(provWidth)}  ${'-'.repeat(20)}  ${'-'.repeat(descWidth)}  ${'-'.repeat(40)}`,
     );
 
     for (const s of filtered) {
@@ -261,12 +423,13 @@ program
       const color = alive ? GREEN : RED;
       const plainStatus = alive ? '▶ running' : '■ stopped';
       const status = `${color}${plainStatus.padEnd(10)}${RESET}`;
+      const provider = (s.config.provider || 'anthropic').slice(0, provWidth);
       const model = (s.config.model || '(default)').slice(0, 20);
       const desc = (s.config.description || '').slice(0, descWidth);
       const workDir = s.config.workingDir || '(unknown)';
 
       console.log(
-        `${s.name.padEnd(nameWidth)}  ${status}  ${model.padEnd(20)}  ${desc.padEnd(descWidth)}  ${workDir}`,
+        `${s.name.padEnd(nameWidth)}  ${status}  ${provider.padEnd(provWidth)}  ${model.padEnd(20)}  ${desc.padEnd(descWidth)}  ${workDir}`,
       );
     }
 
@@ -276,6 +439,7 @@ program
     console.log('  multi-claude stop <name>     — Stop a session');
     console.log('  multi-claude stop --all      — Stop all sessions');
     console.log('  multi-claude start --all     — Start all stopped sessions');
+    console.log('  multi-claude init            — Initialize sessions for detected providers');
     console.log('  tmux attach -t multi-claude  — View all sessions in tmux');
   });
 
@@ -324,6 +488,7 @@ program
   .command('config <name>')
   .description('Show or update session configuration')
   .option('-m, --model <model>', 'Change LLM model')
+  .option('--provider <id>', 'Change LLM provider preset')
   .option('-d, --dir <path>', 'Change working directory')
   .option('--desc <description>', 'Change session description')
   .option('-s, --system-prompt <prompt>', 'Change system prompt')
@@ -333,7 +498,7 @@ program
   .option('--mcp-config <configs...>', 'Change MCP server config files')
   .option('--extra-args <args...>', 'Change extra arguments passed to claude')
   .option('--json', 'Output configuration as JSON')
-  .option('--unset <fields...>', 'Unset configuration fields (model, workingDir, description, systemPrompt, permissionMode, effort, settingsFile, mcpConfig, extraArgs)')
+  .option('--unset <fields...>', 'Unset configuration fields (model, workingDir, description, systemPrompt, permissionMode, effort, settingsFile, mcpConfig, extraArgs, provider)')
   .action((name: string, options: Record<string, any>) => {
     const session = getSession(name);
     if (!session) {
@@ -343,6 +508,7 @@ program
 
     const isModifying =
       options.model !== undefined ||
+      options.provider !== undefined ||
       options.dir !== undefined ||
       options.desc !== undefined ||
       options.systemPrompt !== undefined ||
@@ -362,6 +528,7 @@ program
       }
       console.log(`Configuration for "${name}":`);
       console.log(`  Description    : ${cfg.description || '(none)'}`);
+      console.log(`  Provider       : ${cfg.provider || '(none)'}`);
       console.log(`  Model          : ${cfg.model || '(default)'}`);
       console.log(`  Working Dir    : ${cfg.workingDir || '(not set)'}`);
       console.log(`  Permission Mode: ${cfg.permissionMode || '(default)'}`);
@@ -376,6 +543,21 @@ program
     }
 
     if (options.model !== undefined) cfg.model = options.model || undefined;
+    if (options.provider !== undefined) {
+      const prov = options.provider ? getProvider(options.provider) : null;
+      if (options.provider && !prov) {
+        console.log(`Warning: Unknown provider "${options.provider}".`);
+      } else {
+        cfg.provider = options.provider || undefined;
+        // Auto-resolve settings file for non-builtin providers
+        if (options.provider && options.provider !== 'anthropic') {
+          ensureSettingsFiles([options.provider]);
+          cfg.settingsFile = resolveProviderSettings(options.provider);
+        } else if (!options.provider) {
+          cfg.settingsFile = undefined;
+        }
+      }
+    }
     if (options.dir !== undefined) cfg.workingDir = options.dir ? path.resolve(options.dir) : undefined;
     if (options.desc !== undefined) cfg.description = options.desc || undefined;
     if (options.systemPrompt !== undefined) cfg.systemPrompt = options.systemPrompt || undefined;
@@ -388,6 +570,7 @@ program
     if (options.unset) {
       const unsetMap: Record<string, keyof SessionConfig> = {
         model: 'model',
+        provider: 'provider',
         workingDir: 'workingDir',
         description: 'description',
         systemPrompt: 'systemPrompt',
@@ -411,6 +594,7 @@ program
 
     console.log(`Configuration for "${name}" updated:`);
     console.log(`  Description    : ${cfg.description || '(none)'}`);
+    console.log(`  Provider       : ${cfg.provider || '(none)'}`);
     console.log(`  Model          : ${cfg.model || '(default)'}`);
     console.log(`  Working Dir    : ${cfg.workingDir || '(not set)'}`);
     console.log(`  Permission Mode: ${cfg.permissionMode || '(default)'}`);
@@ -567,19 +751,62 @@ program
 
 program
   .command('models')
-  .description('List common LLM model aliases for reference')
-  .action(() => {
-    console.log('Common model aliases (use with --model):\n');
-    console.log('Anthropic Claude models:');
-    console.log('  sonnet           — Latest Claude Sonnet');
-    console.log('  opus             — Latest Claude Opus');
-    console.log('  haiku            — Latest Claude Haiku');
-    console.log('  claude-sonnet-4-6');
-    console.log('  claude-opus-4-7');
+  .description('List available models by provider')
+  .option('--provider <id>', 'Show models for a specific provider')
+  .option('--json', 'Output as JSON')
+  .action((options: Record<string, any>) => {
+    if (options.provider) {
+      const provider = getProvider(options.provider);
+      if (!provider) {
+        console.error(`Unknown provider "${options.provider}".`);
+        console.error(`Available: ${PROVIDER_PRESETS.map(p => p.id).join(', ')}`);
+        process.exit(1);
+      }
+
+      if (options.json) {
+        console.log(JSON.stringify({ provider: provider.id, name: provider.name, models: provider.models }, null, 2));
+        return;
+      }
+
+      console.log(`${provider.name} models (use with --model and --provider ${provider.id}):\n`);
+      for (const m of provider.models) {
+        const tag = m.reasoning ? ' [reasoning]' : '';
+        console.log(`  ${m.id.padEnd(45)} ${m.name}${tag}`);
+      }
+      if (provider.envVar) {
+        console.log(`\nRequires: ${provider.envVar} to be set`);
+      }
+      console.log(`\nStart: multi-claude start <name> --provider ${provider.id} --model ${provider.defaultModel}`);
+      return;
+    }
+
+    if (options.json) {
+      const output = PROVIDER_PRESETS.map(p => ({
+        id: p.id,
+        name: p.name,
+        envVar: p.envVar || null,
+        baseUrl: p.baseUrl,
+        defaultModel: p.defaultModel,
+        models: p.models,
+      }));
+      console.log(JSON.stringify(output, null, 2));
+      return;
+    }
+
+    console.log('Available LLM provider presets:\n');
+    for (const p of PROVIDER_PRESETS) {
+      const count = p.models.length;
+      const builtin = p.builtin ? ' (built-in)' : '';
+      const available = p.builtin || (p.envVar && process.env[p.envVar]) || !p.envVar
+        ? `${GREEN}✓${RESET}`
+        : `${RED}✗${RESET}`;
+      console.log(`  ${available} ${p.id.padEnd(14)} ${p.name.padEnd(20)} ${count} models${builtin}`);
+    }
     console.log();
-    console.log('Third-party providers (if configured):');
-    console.log('  Use the full model ID from your provider.');
-    console.log('  See: https://docs.anthropic.com/en/docs/claude-code/settings');
+    console.log(`  ${GREEN}✓${RESET} = API key detected   ${RED}✗${RESET} = API key not set`);
+    console.log();
+    console.log('Use --provider <id> to see models for a specific provider:');
+    console.log('  multi-claude models --provider openai');
   });
 
 // ─── logs ───────────────────────────────────────────────────────────────────
