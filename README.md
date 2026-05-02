@@ -26,7 +26,7 @@ Stopping a session kills its tmux window but preserves the config. Use `--remove
 ## Installation
 
 ```bash
-git clone <repo-url> && cd multi_terminal
+git clone https://github.com/QHX-BNU/multi_terminal && cd multi_terminal
 npm install
 npm run build
 npm link          # makes `multi-claude` available globally
