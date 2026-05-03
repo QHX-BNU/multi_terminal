@@ -1,4 +1,4 @@
-import { spawnSync } from 'child_process';
+import { spawnSync, SpawnSyncReturns } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -9,6 +9,9 @@ export const SETTINGS_DIR = path.join(os.homedir(), '.multi-claude', 'settings')
 
 const VALID_SESSION_NAME = /^[a-zA-Z0-9][-a-zA-Z0-9_]*$/;
 
+const PANE_READY_TIMEOUT_MS = 5000;
+const PANE_POLL_INTERVAL_MS = 100;
+
 export function checkTmux(): boolean {
   const result = spawnSync('tmux', ['-V'], { stdio: 'ignore' });
   return result.status === 0;
@@ -16,10 +19,12 @@ export function checkTmux(): boolean {
 
 export function validateSessionName(name: string): string | null {
   if (!name || name.trim().length === 0) return 'Session name must not be empty.';
+  if (name.length > 64) return 'Session name must be 64 characters or fewer.';
   if (name.includes(':')) return 'Session name must not contain colons (:).';
   if (name.includes('.')) return 'Session name must not contain dots (.).';
   if (/\s/.test(name)) return 'Session name must not contain whitespace.';
-  if (!VALID_SESSION_NAME.test(name)) return 'Session name must start with a letter or number and contain only letters, numbers, hyphens, and underscores.';
+  if (!VALID_SESSION_NAME.test(name))
+    return 'Session name must start with a letter or number and contain only letters, numbers, hyphens, and underscores.';
   return null;
 }
 
@@ -64,87 +69,145 @@ export function buildClaudeArgs(config: SessionConfig): string[] {
  * Check whether a tmux session/window exists.
  */
 function tmuxHasWindow(windowName: string): boolean {
-  const result = spawnSync('tmux', ['has-session', '-t', windowName], { stdio: 'ignore' });
+  const result = spawnSync('tmux', ['has-session', '-t', windowName], {
+    stdio: 'ignore',
+    timeout: 5000,
+  });
   return result.status === 0;
 }
 
 /**
- * Run a tmux command safely without shell interpolation.
- * All arguments are passed as an array to avoid /bin/sh involvement.
+ * Run a tmux command. Returns the spawn result so callers can check success.
  */
-function tmux(args: string[]): void {
-  spawnSync('tmux', args, { stdio: 'ignore' });
+function tmux(args: string[]): SpawnSyncReturns<Buffer> {
+  return spawnSync('tmux', args, { stdio: 'ignore', timeout: 10000 });
 }
 
 /**
  * Poll until a tmux pane is ready (shell initialized).
  * After creating a new window, the shell inside needs a moment to start.
  * Sending keys too early causes them to be lost.
+ * Returns true if pane became ready, false on timeout.
  */
-function waitForPane(windowName: string, timeoutMs = 3000): void {
+function waitForPane(windowName: string, timeoutMs = PANE_READY_TIMEOUT_MS): boolean {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
-    const result = spawnSync('tmux', ['list-panes', '-t', windowName], { encoding: 'utf-8' });
+    const result = spawnSync('tmux', ['list-panes', '-t', windowName], {
+      encoding: 'utf-8',
+      timeout: 2000,
+    });
     if (result.status === 0 && (result.stdout || '').trim()) {
-      spawnSync('sleep', ['0.15']);
-      return;
+      spawnSync('sleep', ['0.2']);
+      return true;
     }
-    spawnSync('sleep', ['0.1']);
+    spawnSync('sleep', [(PANE_POLL_INTERVAL_MS / 1000).toString()]);
   }
+  return false;
 }
 
 /**
  * Check whether the `claude` binary is available in PATH.
  */
 export function checkClaudeCli(): boolean {
-  const result = spawnSync('which', ['claude'], { stdio: 'ignore' });
+  const result = spawnSync('which', ['claude'], { stdio: 'ignore', timeout: 5000 });
   return result.status === 0;
 }
 
 /**
+ * Validate that a working directory exists and is accessible.
+ */
+export function validateWorkingDir(dir: string): string | null {
+  try {
+    const stat = fs.statSync(dir);
+    if (!stat.isDirectory()) return `"${dir}" exists but is not a directory.`;
+    try {
+      fs.accessSync(dir, fs.constants.R_OK | fs.constants.X_OK);
+    } catch {
+      return `Directory "${dir}" is not readable/executable.`;
+    }
+    return null;
+  } catch {
+    return `Directory "${dir}" does not exist.`;
+  }
+}
+
+/**
  * Start a new Claude Code session inside a tmux window.
- * Uses tmux send-keys to avoid shell injection through tmux new-window's shell command argument.
+ * Uses tmux send-keys -l to avoid shell injection through tmux new-window's shell command argument.
+ * Throws on failure.
  */
 export function startSession(config: SessionConfig): { tmuxWindow: string } {
   const windowName = `${TMUX_SESSION_PREFIX}:${config.name}`;
   const workDir = config.workingDir || process.cwd();
 
+  const dirErr = validateWorkingDir(workDir);
+  if (dirErr) throw new Error(dirErr);
+
   if (tmuxHasWindow(windowName)) {
-    tmux(['kill-window', '-t', windowName]);
+    const killResult = tmux(['kill-window', '-t', windowName]);
+    if (killResult.status !== 0 && killResult.status !== 1) {
+      throw new Error(`Failed to kill existing tmux window "${windowName}".`);
+    }
   }
 
   const sessionExists = tmuxHasWindow(TMUX_SESSION_PREFIX);
+  let createResult: SpawnSyncReturns<Buffer>;
   if (sessionExists) {
-    tmux(['new-window', '-t', TMUX_SESSION_PREFIX, '-n', config.name]);
+    createResult = tmux(['new-window', '-t', TMUX_SESSION_PREFIX, '-n', config.name]);
   } else {
-    tmux(['new-session', '-d', '-s', TMUX_SESSION_PREFIX, '-n', config.name]);
+    createResult = tmux([
+      'new-session', '-d', '-s', TMUX_SESSION_PREFIX, '-n', config.name,
+    ]);
+  }
+  if (createResult.status !== 0) {
+    throw new Error(
+      `Failed to create tmux window for session "${config.name}" (exit code ${createResult.status}).`,
+    );
   }
 
-  waitForPane(windowName);
+  const paneReady = waitForPane(windowName);
+  if (!paneReady) {
+    tmux(['kill-window', '-t', windowName]);
+    throw new Error(
+      `Tmux pane for session "${config.name}" did not become ready within ${PANE_READY_TIMEOUT_MS}ms.`,
+    );
+  }
 
   const claudeArgs = buildClaudeArgs(config);
   const quotedArgs = claudeArgs.map(shellQuote);
   const cmdLine = `cd ${shellQuote(workDir)} && claude ${quotedArgs.join(' ')}\n`;
 
-  spawnSync('tmux', ['send-keys', '-l', '-t', windowName, cmdLine], { stdio: 'ignore' });
+  const sendResult = spawnSync('tmux', ['send-keys', '-l', '-t', windowName, cmdLine], {
+    stdio: 'ignore',
+    timeout: 5000,
+  });
+  if (sendResult.status !== 0) {
+    tmux(['kill-window', '-t', windowName]);
+    throw new Error(`Failed to send command to tmux pane for session "${config.name}".`);
+  }
 
   return { tmuxWindow: windowName };
 }
 
 /**
  * Stop a session by killing its tmux window.
+ * Returns true if a window was killed.
  */
 export function stopSession(name: string): boolean {
   const windowName = `${TMUX_SESSION_PREFIX}:${name}`;
   if (!tmuxHasWindow(windowName)) return false;
 
-  tmux(['kill-window', '-t', windowName]);
+  const result = tmux(['kill-window', '-t', windowName]);
+  if (result.status !== 0) return false;
 
-  // If no more windows in the session, kill the session too
-  const listResult = spawnSync('tmux', ['list-windows', '-t', TMUX_SESSION_PREFIX, '-F', '#{window_name}'], { encoding: 'utf-8' });
+  const listResult = spawnSync(
+    'tmux',
+    ['list-windows', '-t', TMUX_SESSION_PREFIX, '-F', '#{window_name}'],
+    { encoding: 'utf-8', timeout: 5000 },
+  );
   const windows = (listResult.stdout || '').trim();
   if (listResult.status !== 0 || !windows || windows.split('\n').filter(Boolean).length === 0) {
-    tmux(['kill-session', '-t', TMUX_SESSION_PREFIX]);
+    spawnSync('tmux', ['kill-session', '-t', TMUX_SESSION_PREFIX], { stdio: 'ignore', timeout: 5000 });
   }
 
   return true;
@@ -156,7 +219,10 @@ export function stopSession(name: string): boolean {
 export function renameWindow(oldName: string, newName: string): boolean {
   const oldWindow = `${TMUX_SESSION_PREFIX}:${oldName}`;
   if (!tmuxHasWindow(oldWindow)) return false;
-  const result = spawnSync('tmux', ['rename-window', '-t', oldWindow, newName], { stdio: 'ignore' });
+  const result = spawnSync('tmux', ['rename-window', '-t', oldWindow, newName], {
+    stdio: 'ignore',
+    timeout: 5000,
+  });
   return result.status === 0;
 }
 
@@ -166,9 +232,18 @@ export function renameWindow(oldName: string, newName: string): boolean {
  */
 export function attachSession(windowName?: string): void {
   if (windowName) {
-    spawnSync('tmux', ['select-window', '-t', windowName], { stdio: 'ignore' });
+    const selResult = spawnSync('tmux', ['select-window', '-t', windowName], {
+      stdio: 'ignore',
+      timeout: 5000,
+    });
+    if (selResult.status !== 0) {
+      throw new Error(`Failed to select tmux window "${windowName}". Is the session running?`);
+    }
   }
-  const result = spawnSync('tmux', ['attach-session', '-t', TMUX_SESSION_PREFIX], { stdio: 'inherit' });
+  const result = spawnSync('tmux', ['attach-session', '-t', TMUX_SESSION_PREFIX], {
+    stdio: 'inherit',
+    timeout: 0,
+  });
   if (result.status !== 0) {
     throw new Error('Failed to attach to tmux session. Is tmux running?');
   }
@@ -185,7 +260,11 @@ export function isSessionAlive(name: string): boolean {
  * List all running tmux windows for our session.
  */
 export function listRunningWindows(): string[] {
-  const result = spawnSync('tmux', ['list-windows', '-t', TMUX_SESSION_PREFIX, '-F', '#{window_name}'], { encoding: 'utf-8' });
+  const result = spawnSync(
+    'tmux',
+    ['list-windows', '-t', TMUX_SESSION_PREFIX, '-F', '#{window_name}'],
+    { encoding: 'utf-8', timeout: 5000 },
+  );
   if (result.status !== 0) return [];
   const output = (result.stdout || '').trim();
   return output ? output.split('\n').filter(Boolean) : [];
@@ -203,17 +282,21 @@ export function resolveProviderSettings(providerId: string): string | undefined 
 
 /**
  * Capture the visible content (or scrollback buffer) of a tmux pane.
- * Returns the text content.
+ * Limited to prevent memory issues.
  */
 export function capturePane(name: string, lines?: number): string {
   const windowName = `${TMUX_SESSION_PREFIX}:${name}`;
   const args = ['capture-pane', '-t', windowName, '-p'];
   if (lines !== undefined && lines > 0) {
-    args.push('-S', `-${lines}`);
+    args.push('-S', `-${Math.min(lines, 1_000_000)}`);
   } else {
-    args.push('-S', '-');
+    args.push('-S', '-10000');
   }
-  const result = spawnSync('tmux', args, { encoding: 'utf-8' });
+  const result = spawnSync('tmux', args, {
+    encoding: 'utf-8',
+    timeout: 10000,
+    maxBuffer: 50 * 1024 * 1024,
+  });
   if (result.status !== 0) return '';
   return (result.stdout || '');
 }

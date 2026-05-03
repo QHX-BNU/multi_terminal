@@ -137,10 +137,15 @@ export function getProvider(id: string): ProviderPreset | undefined {
   return PROVIDER_PRESETS.find(p => p.id === id);
 }
 
+/**
+ * Detect which providers have their API key environment variable set.
+ * Builtin providers (Anthropic) are always included.
+ * Ollama is always included (no env var needed — local).
+ */
 export function detectProviders(): ProviderPreset[] {
   return PROVIDER_PRESETS.filter(p => {
-    if (p.builtin) return !!process.env[p.envVar] || !!process.env['ANTHROPIC_API_KEY'];
-    if (!p.envVar) return true;
+    if (p.builtin) return true;
+    if (!p.envVar) return true; // ollama — always detectable
     return !!process.env[p.envVar];
   });
 }
@@ -154,11 +159,20 @@ export function generateSettingsFile(provider: ProviderPreset): string {
   settings.env = { ANTHROPIC_BASE_URL: provider.baseUrl };
 
   if (provider.envVar) {
-    settings.apiKeyHelper = `echo \$${provider.envVar}`;
+    settings.apiKeyHelper = `echo $${provider.envVar}`;
   }
 
   const filePath = path.join(SETTINGS_DIR, `${provider.id}.json`);
-  fs.writeFileSync(filePath, JSON.stringify(settings, null, 2), { mode: 0o600 });
+  const tmpPath = filePath + '.tmp';
+  try {
+    fs.writeFileSync(tmpPath, JSON.stringify(settings, null, 2), { encoding: 'utf-8', mode: 0o600 });
+    fs.renameSync(tmpPath, filePath);
+  } catch (err) {
+    try { fs.unlinkSync(tmpPath); } catch { /* ignore */ }
+    throw new Error(
+      `Failed to write settings file for provider "${provider.id}": ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
   return filePath;
 }
 
